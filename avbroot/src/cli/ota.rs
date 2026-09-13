@@ -792,6 +792,7 @@ fn set_vabc_algo(header: &mut PayloadHeader, vabc_algo: VabcAlgo) -> Result<bool
 /// If changes were made to a vbmeta header, then the image in `images` will be
 /// replaced with a new in-memory reader containing the new image. Otherwise,
 /// the image is removed from `images` entirely to avoid needing to repack it.
+#[allow(clippy::too_many_arguments)]
 fn update_vbmeta_headers(
     images: &mut HashMap<String, InputFile>,
     headers: &mut HashMap<String, Header>,

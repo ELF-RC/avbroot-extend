@@ -124,9 +124,9 @@ pub fn patch_system_image(
 
     let parent_span = Span::current();
 
-    let (mut header, footer, image_size) = match avb::load_image(UserPosFile::new(raw_file)) {
+    let (header, footer, image_size) = match avb::load_image(UserPosFile::new(raw_file)) {
         Ok(result) => (Some(result.0), result.1, result.2),
-        Err(e) if key.is_none() => {
+        Err(_e) if key.is_none() => {
             // AVB is disabled, so the image may not have a vbmeta footer or
             // header. Fall back to searching the entire image for
             // otacerts.zip.
