@@ -464,6 +464,13 @@ pub fn sort<T: Ord>(iter: impl Iterator<Item = T>) -> Vec<T> {
     items
 }
 
+/// Parse a size string into a number of bytes.
+///
+/// The value must be a plain byte count. For example, `1674874880`.
+pub fn parse_size(input: &str) -> Result<u64, std::num::ParseIntError> {
+    input.trim().parse::<u64>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,5 +543,16 @@ mod tests {
         assert!(!ranges_contains(&[0..4], &4));
         assert!(!ranges_contains(&[0..4, 5..8], &4));
         assert!(ranges_contains(&[0..4, 5..8], &6));
+    }
+
+    #[test]
+    fn test_parse_size() {
+        assert_eq!(parse_size("0").unwrap(), 0);
+        assert_eq!(parse_size("1674874880").unwrap(), 1674874880);
+        assert_eq!(parse_size(" 100 ").unwrap(), 100);
+        assert!(parse_size("4K").is_err());
+        assert!(parse_size("2M").is_err());
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("").is_err());
     }
 }

@@ -50,7 +50,8 @@ use crate::{
         system,
     },
     protobuf::{
-        build::tools::releasetools::OtaMetadata, chromeos_update_engine::DeltaArchiveManifest,
+        build::tools::releasetools::OtaMetadata,
+        chromeos_update_engine::{DeltaArchiveManifest, PartitionUpdate},
         recovery_update_verifier::CareMap,
     },
     stream::{
@@ -1040,6 +1041,7 @@ fn patch_ota_payload(
     payload: &(dyn ReadAt + Sync),
     writer: impl Write,
     external_images: &HashMap<String, PathBuf>,
+    add_partitions: &HashMap<String, (PathBuf, Option<u64>)>,
     re_sign_images: &HashSet<String>,
     boot_patchers: &[Box<dyn BootImagePatch + Sync>],
     skip_system_ota_cert: bool,
@@ -1086,6 +1088,15 @@ fn patch_ota_payload(
     for name in re_sign_images {
         if !all_partitions.contains(name.as_str()) {
             bail!("Cannot re-sign non-existent {name} partition");
+        }
+    }
+
+    // Validate that add-partition partitions do not already exist.
+    for (name, (_, _)) in add_partitions {
+        if all_partitions.contains(name.as_str()) {
+            bail!(
+                "Cannot add partition {name} because it already exists in the payload (use --replace instead)"
+            );
         }
     }
 
@@ -1173,23 +1184,97 @@ fn patch_ota_payload(
             recow_image(name, &input_file.file, &mut header, cancel_signal)
         })?;
 
-    // Compute care map. For unmodified images still in the original payload,
-    // this only requires extracting the chunks containing the AVB metadata.
+    // Compress and add new partitions.
+    let block_size = header.manifest.block_size();
+    let mut added_raw_files = HashMap::<String, Arc<File>>::new();
+    let mut added_compressed_files: HashMap<String, (InputFile, Vec<Range<usize>>)> =
+        HashMap::new();
+
+    for (name, (path, size)) in add_partitions {
+        let _span = debug_span!("image", name).entered();
+
+        let file = File::open(path)
+            .with_context(|| format!("Failed to open add partition image: {path:?}"))?;
+        let file_size = file
+            .metadata()
+            .with_context(|| format!("Failed to get file size: {path:?}"))?
+            .len();
+
+        if file_size % u64::from(block_size) != 0 {
+            bail!(
+                "Add partition {name} size ({file_size}) is not aligned to block size ({block_size})"
+            );
+        }
+
+        let padded_file = match size {
+            Some(size) => {
+                if *size < file_size {
+                    bail!(
+                        "Add partition {name} size ({size}) is smaller than the image size ({file_size})"
+                    );
+                }
+                if size % u64::from(block_size) != 0 {
+                    bail!(
+                        "Add partition {name} size ({size}) is not aligned to block size ({block_size})"
+                    );
+                }
+
+                info!("Padding {name} from {file_size} bytes to {size} bytes");
+                let mut padded = tempfile::tempfile().with_context(|| {
+                    format!("Failed to create temp file for padded image: {name}")
+                })?;
+                stream::copy_n(&mut &file, &mut padded, file_size, cancel_signal)
+                    .with_context(|| format!("Failed to pad image: {name}"))?;
+                padded
+                    .set_len(*size)
+                    .with_context(|| format!("Failed to set padded image size: {name}"))?;
+                padded
+            }
+            None => file,
+        };
+
+        info!("Compressing full image: {name}");
+        let compressed_writer = tempfile::tempfile()
+            .with_context(|| format!("Failed to create temp file for: {name}"))?;
+        let (partition_info, operations, _cow_estimate) = payload::compress_image(
+            &padded_file,
+            &compressed_writer,
+            name,
+            block_size,
+            None,
+            cancel_signal,
+        )
+        .with_context(|| format!("Failed to compress add partition: {name}"))?;
+
+        let mut partition_update = PartitionUpdate::default();
+        partition_update.partition_name = name.clone();
+        partition_update.new_partition_info = Some(partition_info);
+        partition_update.operations = operations;
+        header.manifest.partitions.push(partition_update);
+
+        added_raw_files.insert(name.clone(), Arc::new(padded_file));
+        let input_file = InputFile {
+            file: Arc::new(compressed_writer),
+            state: InputFileState::External,
+        };
+        let ops_range = 0..header.manifest.partitions.last().unwrap().operations.len();
+        added_compressed_files.insert(name.clone(), (input_file, vec![ops_range]));
+    }
+
     let care_map = if disable_avb {
-        // Match the old --disable-avb behavior: do not regenerate care_map.pb
-        // from images whose AVB metadata may be absent or intentionally stale.
         None
     } else {
-        Some(
-            care_map::generate_care_map(
-                payload,
-                input_files
+        let overrides = input_files
+            .iter()
+            .map(|(name, f)| (name.as_str(), &f.file as &(dyn ReadAt + Sync)))
+            .chain(
+                added_raw_files
                     .iter()
-                    .map(|(name, f)| (name.as_str(), &f.file as &(dyn ReadAt + Sync))),
-                &header,
-                cancel_signal,
-            )
-            .context("Failed to generate new care map")?,
+                    .map(|(name, file)| (name.as_str(), &**file as &(dyn ReadAt + Sync))),
+            );
+        Some(
+            care_map::generate_care_map(payload, overrides, &header, cancel_signal)
+                .context("Failed to generate new care map")?,
         )
     };
 
@@ -1223,6 +1308,8 @@ fn patch_ota_payload(
             Ok((name, (input_file, modified_operations)))
         })
         .collect::<Result<HashMap<_, _>>>()?;
+
+    compressed_files.extend(added_compressed_files);
 
     info!("Generating new OTA payload");
 
@@ -1325,6 +1412,7 @@ fn patch_ota_zip(
     zip_reader: &ZipArchive<ReaderAtWrapper<&File>>,
     zip_writer: &mut ZipArchiveWriter<impl Write>,
     external_images: &HashMap<String, PathBuf>,
+    add_partitions: &HashMap<String, (PathBuf, Option<u64>)>,
     re_sign_images: &HashSet<String>,
     boot_patchers: &[Box<dyn BootImagePatch + Sync>],
     skip_system_ota_cert: bool,
@@ -1528,6 +1616,7 @@ fn patch_ota_zip(
                     &payload_reader,
                     &mut data_writer,
                     external_images,
+                    add_partitions,
                     re_sign_images,
                     boot_patchers,
                     skip_system_ota_cert,
@@ -1778,6 +1867,30 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
         external_images.insert(name.to_owned(), path.to_owned());
     }
 
+    let mut add_partitions = HashMap::new();
+
+    for item in &cli.add_partition {
+        let name = item[0]
+            .to_str()
+            .ok_or_else(|| anyhow!("Invalid partition name: {:?}", item[0]))?;
+        let path = Path::new(&item[1]);
+
+        if !path.exists() {
+            bail!("Add partition image does not exist: {path:?}");
+        }
+
+        let size = if let Some(size) = item.get(2) {
+            let size = size
+                .to_str()
+                .ok_or_else(|| anyhow!("Invalid size: {:?}", size))?;
+            Some(util::parse_size(size).with_context(|| format!("Invalid size: {size}"))?)
+        } else {
+            None
+        };
+
+        add_partitions.insert(name.to_owned(), (path.to_owned(), size));
+    }
+
     let re_sign_images = cli.re_sign.iter().cloned().collect::<HashSet<_>>();
 
     let mut boot_patchers = Vec::<Box<dyn BootImagePatch + Sync>>::new();
@@ -1847,6 +1960,7 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
         &zip_reader,
         &mut zip_writer,
         &external_images,
+        &add_partitions,
         &re_sign_images,
         &boot_patchers,
         cli.skip_system_ota_cert,
@@ -2625,6 +2739,23 @@ pub struct PatchCli {
         help_heading = HEADING_PATH,
     )]
     pub replace: Vec<OsString>,
+
+    /// Add a new partition image to the payload.
+    ///
+    /// The partition must not already exist in the payload.
+    ///
+    /// If SIZE is specified, the image is zero-padded to that size before
+    /// being added. This is useful for adding a partition that already exists
+    /// on the device (eg. an empty preloaded partition) but is not present in
+    /// the OTA. SIZE must match the actual partition size on the device.
+    #[arg(
+        long,
+        value_names = ["PARTITION", "FILE", "SIZE"],
+        value_parser = value_parser!(OsString),
+        num_args = 2..=3,
+        help_heading = HEADING_PATH,
+    )]
+    pub add_partition: Vec<Vec<OsString>>,
 
     /// Re-sign unmodified partition image.
     ///
