@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Write,
     fs::File,
-    io::{self, BufRead, BufReader, Cursor, Read},
+    io::{self, BufRead, BufReader, Cursor, Read, SeekFrom},
     num::ParseIntError,
     ops::{Range, RangeFrom},
     path::{Path, PathBuf},
@@ -22,7 +22,7 @@ use rayon::iter::{IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelI
 use regex::bytes::Regex;
 use ring::digest::Context;
 use thiserror::Error;
-use tracing::{Span, debug, debug_span, trace, warn};
+use tracing::{Span, debug, debug_span, info, trace, warn};
 use x509_cert::Certificate;
 
 use crate::{
@@ -166,7 +166,7 @@ pub struct BootLayoutInfo {
 #[derive(Clone, Eq, PartialEq)]
 pub struct BootImageInfo {
     pub header: Header,
-    pub footer: Footer,
+    pub footer: Option<Footer>,
     pub image_size: u64,
     pub boot_image: BootImage,
 }
@@ -1291,34 +1291,75 @@ impl BootImagePatch for PrepatchedImagePatcher {
     }
 }
 
-fn load_boot_image(reader: &mut dyn ReadSeek) -> Result<BootImageInfo> {
-    let (header, footer, image_size) = avb::load_image(&mut *reader).map_err(Error::AvbLoad)?;
-    let Some(footer) = footer else {
-        return Err(Error::NoFooter);
+fn load_boot_image(
+    reader: &mut dyn ReadSeek,
+    key: Option<&SigningPrivateKey>,
+) -> Result<BootImageInfo> {
+    let (header, footer, image_size) = match avb::load_image(&mut *reader) {
+        Ok(result) => result,
+        Err(_) if key.is_none() => {
+            // AVB is disabled, so the image may not have a vbmeta footer or
+            // header. Fall back to a blank header and treat the entire image
+            // as the boot image.
+            info!("Loading boot image without AVB footer");
+            let size = reader
+                .seek(SeekFrom::End(0))
+                .map_err(Error::BootImageSeek)?;
+            let boot_image = BootImage::from_reader(
+                SectionReader::new(reader, 0, size).map_err(Error::BootImageSeek)?,
+            )
+            .map_err(Error::BootImageLoad)?;
+            return Ok(BootImageInfo {
+                header: Header::default(),
+                footer: None,
+                image_size: size,
+                boot_image,
+            });
+        }
+        Err(e) => return Err(Error::AvbLoad(e)),
     };
 
-    let section_reader =
-        SectionReader::new(reader, 0, footer.original_image_size).map_err(Error::BootImageSeek)?;
-    let boot_image = BootImage::from_reader(section_reader).map_err(Error::BootImageLoad)?;
+    let section_size = match &footer {
+        Some(f) => f.original_image_size,
+        None if key.is_none() => {
+            info!("Loading boot image without AVB footer");
+            image_size
+        }
+        None => return Err(Error::NoFooter),
+    };
 
-    let info = BootImageInfo {
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(Error::BootImageSeek)?;
+    let boot_image = BootImage::from_reader(
+        SectionReader::new(reader, 0, section_size).map_err(Error::BootImageSeek)?,
+    )
+    .map_err(Error::BootImageLoad)?;
+
+    Ok(BootImageInfo {
         header,
         footer,
         image_size,
         boot_image,
-    };
-
-    trace!("Loaded {image_size} byte boot image");
-
-    Ok(info)
+    })
 }
 
 fn save_boot_image(
     writer: &mut dyn WriteSeek,
     info: &mut BootImageInfo,
-    key: &SigningPrivateKey,
+    key: Option<&SigningPrivateKey>,
     method: SigningMethod,
 ) -> Result<()> {
+    let Some(_footer) = &mut info.footer else {
+        // The image has no vbmeta footer (AVB is disabled). Just write the
+        // boot image back without any appended AVB data.
+        info!("Saving boot image without AVB footer");
+        info.boot_image
+            .to_writer(writer)
+            .map_err(Error::BootImageSave)?;
+        return Ok(());
+    };
+
     let AppendedDescriptorMut::Hash(descriptor) = info
         .header
         .appended_descriptor_mut()
@@ -1340,18 +1381,24 @@ fn save_boot_image(
     "sha256".clone_into(&mut descriptor.hash_algorithm);
     descriptor.root_digest = context.finish().as_ref().to_vec();
 
-    if !info.header.public_key.is_empty() {
+    if let Some(key) = key
+        && !info.header.public_key.is_empty()
+    {
         debug!("Signing boot image");
         info.header
             .set_algo_for_key(key, false)
             .map_err(Error::AvbUpdate)?;
         info.header.sign(key, method).map_err(Error::AvbUpdate)?;
+    } else if key.is_none() {
+        // AVB is disabled; leave the header unsigned.
+        info.header.algorithm_type = avb::AlgorithmType::None;
+        info.header.clear_sig();
     }
 
     avb::write_appended_image(
         writer,
         &info.header,
-        &mut info.footer,
+        info.footer.as_mut().unwrap(),
         Some(info.image_size),
     )
     .map_err(Error::AvbUpdate)?;
@@ -1373,6 +1420,7 @@ pub trait BootImageOpener {
 pub fn load_boot_images<'a>(
     names: &[&'a str],
     opener: &(dyn BootImageOpener + Sync),
+    key: Option<&SigningPrivateKey>,
 ) -> TargetsResult<(HashMap<&'a str, BootImageInfo>, BootLayoutInfo)> {
     let parent_span = Span::current();
 
@@ -1384,8 +1432,8 @@ pub fn load_boot_images<'a>(
                 .open_original(name)
                 .map_err(|e| TargetsError::Open(name.to_owned(), e))?;
 
-            let info =
-                load_boot_image(&mut reader).map_err(|e| TargetsError::Load(name.to_owned(), e))?;
+            let info = load_boot_image(&mut reader, key)
+                .map_err(|e| TargetsError::Load(name.to_owned(), e))?;
 
             Ok((name, info))
         })
@@ -1406,7 +1454,7 @@ pub fn load_boot_images<'a>(
 pub fn patch_boot_images<'a>(
     names: &[&'a str],
     opener: &(dyn BootImageOpener + Sync),
-    key: &SigningPrivateKey,
+    key: Option<&SigningPrivateKey>,
     method: SigningMethod,
     patchers: &[Box<dyn BootImagePatch + Sync>],
     cancel_signal: &AtomicBool,
@@ -1419,7 +1467,7 @@ pub fn patch_boot_images<'a>(
     }
 
     // Preparse all images. Some patchers need to inspect every candidate.
-    let (mut images, layout) = load_boot_images(names, opener)?;
+    let (mut images, layout) = load_boot_images(names, opener, key)?;
 
     // Find the targets that each patcher wants to patch.
     let all_targets = patchers

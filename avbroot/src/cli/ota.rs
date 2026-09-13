@@ -233,7 +233,7 @@ fn patch_boot_images(
     required_images: &HashMap<String, PartitionFlags>,
     input_files: &mut HashMap<String, InputFile>,
     boot_patchers: &[Box<dyn BootImagePatch + Sync>],
-    key_avb: &SigningPrivateKey,
+    key_avb: Option<&SigningPrivateKey>,
     method: SigningMethod,
     cancel_signal: &AtomicBool,
 ) -> Result<()> {
@@ -289,7 +289,7 @@ fn patch_system_image<'a>(
     required_images: &'a HashMap<String, PartitionFlags>,
     input_files: &mut HashMap<String, InputFile>,
     cert_ota: &Certificate,
-    key_avb: &SigningPrivateKey,
+    key_avb: Option<&SigningPrivateKey>,
     method: SigningMethod,
     cancel_signal: &AtomicBool,
 ) -> Result<(&'a str, Vec<Range<u64>>)> {
@@ -342,11 +342,16 @@ fn patch_system_image<'a>(
 fn re_sign_unmodified_images(
     re_sign_images: &HashSet<String>,
     input_files: &mut HashMap<String, InputFile>,
-    key_avb: &SigningPrivateKey,
+    key_avb: Option<&SigningPrivateKey>,
     method: SigningMethod,
     block_size: u64,
     cancel_signal: &AtomicBool,
 ) -> Result<()> {
+    if key_avb.is_none() {
+        // AVB is disabled; there is no AVB key with which to re-sign images.
+        return Ok(());
+    }
+
     let parent_span = Span::current();
     let input_files = Mutex::new(input_files);
 
@@ -366,7 +371,9 @@ fn re_sign_unmodified_images(
                 .with_context(|| format!("Failed to load AVB metadata: {name}"))?;
             let orig_header = header.clone();
 
-            if !header.public_key.is_empty() {
+            if let Some(key_avb) = key_avb
+                && !header.public_key.is_empty()
+            {
                 header
                     .set_algo_for_key(key_avb, false)
                     .with_context(|| format!("Failed to set signature algorithm: {name}"))?;
@@ -790,7 +797,8 @@ fn update_vbmeta_headers(
     headers: &mut HashMap<String, Header>,
     order: &mut [(String, HashSet<String>)],
     clear_vbmeta_flags: bool,
-    key: &SigningPrivateKey,
+    disable_avb: bool,
+    key: Option<&SigningPrivateKey>,
     method: SigningMethod,
     block_size: u64,
 ) -> Result<()> {
@@ -803,7 +811,10 @@ fn update_vbmeta_headers(
         let parent_header = headers.get_mut(name).unwrap();
         let orig_parent_header = parent_header.clone();
 
-        if parent_header.flags != 0 {
+        if disable_avb {
+            parent_header.flags =
+                Header::FLAG_HASHTREE_DISABLED | Header::FLAG_VERIFICATION_DISABLED;
+        } else if parent_header.flags != 0 {
             if clear_vbmeta_flags {
                 parent_header.flags = 0;
             } else {
@@ -815,6 +826,14 @@ fn update_vbmeta_headers(
         }
 
         for dep in deps.iter() {
+            if disable_avb {
+                // Verified boot is disabled, so there's no need to merge the
+                // dependencies' security and metadata descriptors into the
+                // parent vbmeta header. This also allows images without AVB
+                // footers to be used.
+                continue;
+            }
+
             let input_file = images.get_mut(dep).unwrap();
             let (header, _, _) = avb::load_image(&mut input_file.file)
                 .with_context(|| format!("Failed to load vbmeta footer from image: {dep}"))?;
@@ -832,12 +851,21 @@ fn update_vbmeta_headers(
         // skipping both otacerts.zip patches). We still want the result to be
         // bootable.
         if parent_header != &orig_parent_header || name == "vbmeta" {
-            parent_header
-                .set_algo_for_key(key, false)
-                .with_context(|| format!("Failed to set signature algorithm: {name}"))?;
-            parent_header
-                .sign(key, method)
-                .with_context(|| format!("Failed to sign vbmeta header for image: {name}"))?;
+            if disable_avb {
+                // Leave the vbmeta headers unsigned so that the bootloader
+                // skips verification entirely.
+                parent_header.algorithm_type = avb::AlgorithmType::None;
+                parent_header.clear_sig();
+            } else if let Some(key) = key {
+                parent_header
+                    .set_algo_for_key(key, false)
+                    .with_context(|| format!("Failed to set signature algorithm: {name}"))?;
+                parent_header
+                    .sign(key, method)
+                    .with_context(|| format!("Failed to sign vbmeta header for image: {name}"))?;
+            } else {
+                bail!("vbmeta signing requested, but no AVB key is available");
+            }
 
             let mut writer = tempfile::tempfile()
                 .with_context(|| format!("Failed to create temp file for: {name}"))?;
@@ -1015,13 +1043,14 @@ fn patch_ota_payload(
     boot_patchers: &[Box<dyn BootImagePatch + Sync>],
     skip_system_ota_cert: bool,
     clear_vbmeta_flags: bool,
+    disable_avb: bool,
     vabc_algo_override: Option<VabcAlgo>,
-    key_avb: &SigningPrivateKey,
+    key_avb: Option<&SigningPrivateKey>,
     key_ota: &SigningPrivateKey,
     cert_ota: &Certificate,
     method: SigningMethod,
     cancel_signal: &AtomicBool,
-) -> Result<(PayloadHeader, String, CareMap)> {
+) -> Result<(PayloadHeader, String, Option<CareMap>)> {
     let mut header = PayloadHeader::from_reader(UserPosFile::new(payload))
         .context("Failed to load OTA payload header")?;
     if !header.is_full_ota() {
@@ -1127,6 +1156,7 @@ fn patch_ota_payload(
         &mut vbmeta_headers,
         &mut vbmeta_order,
         clear_vbmeta_flags,
+        disable_avb,
         key_avb,
         method,
         header.manifest.block_size().into(),
@@ -1144,15 +1174,23 @@ fn patch_ota_payload(
 
     // Compute care map. For unmodified images still in the original payload,
     // this only requires extracting the chunks containing the AVB metadata.
-    let care_map = care_map::generate_care_map(
-        payload,
-        input_files
-            .iter()
-            .map(|(name, f)| (name.as_str(), &f.file as &(dyn ReadAt + Sync))),
-        &header,
-        cancel_signal,
-    )
-    .context("Failed to generate new care map")?;
+    let care_map = if disable_avb {
+        // Match the old --disable-avb behavior: do not regenerate care_map.pb
+        // from images whose AVB metadata may be absent or intentionally stale.
+        None
+    } else {
+        Some(
+            care_map::generate_care_map(
+                payload,
+                input_files
+                    .iter()
+                    .map(|(name, f)| (name.as_str(), &f.file as &(dyn ReadAt + Sync))),
+                &header,
+                cancel_signal,
+            )
+            .context("Failed to generate new care map")?,
+        )
+    };
 
     // Drop all unmodified images. We only want to compress modified images.
     // For recowed images, the payload header was already updated with the new
@@ -1290,9 +1328,10 @@ fn patch_ota_zip(
     boot_patchers: &[Box<dyn BootImagePatch + Sync>],
     skip_system_ota_cert: bool,
     clear_vbmeta_flags: bool,
+    disable_avb: bool,
     vabc_algo_override: Option<VabcAlgo>,
     zip_mode: ZipMode,
-    key_avb: &SigningPrivateKey,
+    key_avb: Option<&SigningPrivateKey>,
     key_ota: &SigningPrivateKey,
     cert_ota: &Certificate,
     method: SigningMethod,
@@ -1356,7 +1395,7 @@ fn patch_ota_zip(
         let _span = debug_span!("zip", entry = path).entered();
 
         // Paths we don't care about can be copied without recompression.
-        let raw_copy = path != ota::PATH_CARE_MAP
+        let raw_copy = (path != ota::PATH_CARE_MAP || care_map.is_none())
             && path != ota::PATH_METADATA
             && path != ota::PATH_METADATA_PB
             && path != ota::PATH_OTACERT
@@ -1449,11 +1488,17 @@ fn patch_ota_zip(
         // All remaining entries are written immediately.
         match path.as_str() {
             ota::PATH_CARE_MAP => {
-                info!("Patching zip entry: {path}");
-
-                data_writer
-                    .write_all(&care_map::serialize(care_map.as_ref().unwrap()))
-                    .with_context(|| format!("Failed to write care map: {path}"))?;
+                if let Some(care_map) = &care_map {
+                    info!("Patching zip entry: {path}");
+                    data_writer
+                        .write_all(&care_map::serialize(care_map))
+                        .with_context(|| format!("Failed to write care map: {path}"))?;
+                } else {
+                    info!("Copying zip entry: {path}");
+                    drop(reader);
+                    stream::copy(&mut entry.reader(), &mut data_writer, cancel_signal)
+                        .with_context(|| format!("Failed to copy zip entry: {path}"))?;
+                }
             }
             ota::PATH_OTACERT => {
                 // Use the user's certificate
@@ -1486,6 +1531,7 @@ fn patch_ota_zip(
                     boot_patchers,
                     skip_system_ota_cert,
                     clear_vbmeta_flags,
+                    disable_avb,
                     vabc_algo_override,
                     key_avb,
                     key_ota,
@@ -1497,7 +1543,7 @@ fn patch_ota_zip(
 
                 properties = Some(p);
                 payload_metadata_size = Some(h.blob_offset);
-                care_map = Some(cm);
+                care_map = cm;
             }
             ota::PATH_PROPERTIES => {
                 info!("Patching zip entry: {path}");
@@ -1655,11 +1701,13 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
         Cow::Borrowed,
     );
 
-    let source_avb = PassphraseSource::new(
-        &cli.key_avb,
-        cli.pass_avb_file.as_deref(),
-        cli.pass_avb_env_var.as_deref(),
-    );
+    let source_avb = cli.key_avb.as_deref().map(|key| {
+        PassphraseSource::new(
+            key,
+            cli.pass_avb_file.as_deref(),
+            cli.pass_avb_env_var.as_deref(),
+        )
+    });
     let source_ota = PassphraseSource::new(
         &cli.key_ota,
         cli.pass_ota_file.as_deref(),
@@ -1667,17 +1715,23 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
     );
 
     let (key_avb, key_ota) = if let Some(helper) = &cli.signing_helper {
-        let public_key_avb = crypto::read_pem_public_key_file(&cli.key_avb)
-            .with_context(|| format!("Failed to load key: {:?}", cli.key_avb))?;
+        let key_avb = cli
+            .key_avb
+            .as_ref()
+            .map(|key| {
+                let public_key_avb = crypto::read_pem_public_key_file(key)
+                    .with_context(|| format!("Failed to load key: {key:?}"))?;
+                Ok::<_, anyhow::Error>(SigningPrivateKey::External {
+                    program: helper.clone(),
+                    public_key_file: key.clone(),
+                    public_key: public_key_avb,
+                    passphrase_source: source_avb.clone().unwrap(),
+                })
+            })
+            .transpose()?;
         let public_key_ota = crypto::read_pem_public_key_file(&cli.key_ota)
             .with_context(|| format!("Failed to load key: {:?}", cli.key_ota))?;
 
-        let key_avb = SigningPrivateKey::External {
-            program: helper.clone(),
-            public_key_file: cli.key_avb.clone(),
-            public_key: public_key_avb,
-            passphrase_source: source_avb,
-        };
         let key_ota = SigningPrivateKey::External {
             program: helper.clone(),
             public_key_file: cli.key_ota.clone(),
@@ -1687,8 +1741,14 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
 
         (key_avb, key_ota)
     } else {
-        let key_avb = crypto::read_pem_private_key_file(&cli.key_avb, &source_avb)
-            .with_context(|| format!("Failed to load key: {:?}", cli.key_avb))?;
+        let key_avb = cli
+            .key_avb
+            .as_ref()
+            .map(|key| {
+                crypto::read_pem_private_key_file(key, source_avb.as_ref().unwrap())
+                    .with_context(|| format!("Failed to load key: {key:?}"))
+            })
+            .transpose()?;
         let key_ota = crypto::read_pem_private_key_file(&cli.key_ota, &source_ota)
             .with_context(|| format!("Failed to load key: {:?}", cli.key_ota))?;
 
@@ -1753,7 +1813,11 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
     }
 
     if cli.dsu {
-        boot_patchers.push(Box::new(DsuPubKeyPatcher::new(key_avb.to_public_key())));
+        if let Some(key_avb) = &key_avb {
+            boot_patchers.push(Box::new(DsuPubKeyPatcher::new(key_avb.to_public_key())));
+        } else {
+            warn!("Not adding DSU public key; AVB is disabled");
+        }
     }
 
     let raw_reader = File::open(&cli.input)
@@ -1786,9 +1850,10 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
         &boot_patchers,
         cli.skip_system_ota_cert,
         cli.clear_vbmeta_flags,
+        cli.disable_avb,
         cli.vabc_algo,
         cli.zip_mode,
-        &key_avb,
+        key_avb.as_ref(),
         &key_ota,
         &cert_ota,
         cli.signing_method,
@@ -2301,8 +2366,9 @@ pub fn verify_subcommand(cli: &VerifyCli, cancel_signal: &AtomicBool) -> Result<
         }
     }
 
-    let (boot_images, layout) = boot::load_boot_images(&boot_image_names, &Opener(temp_dir.path()))
-        .context("Failed to load all boot images")?;
+    let (boot_images, layout) =
+        boot::load_boot_images(&boot_image_names, &Opener(temp_dir.path()), None)
+            .context("Failed to load all boot images")?;
     let targets = OtaCertPatcher::new(ota_info.cert.clone())
         .find_targets(layout, &boot_images, cancel_signal)
         .context("Failed to find boot image containing otacerts.zip")?;
@@ -2452,15 +2518,17 @@ pub struct PatchCli {
     /// Signing key for vbmeta headers.
     ///
     /// This should normally be a private key. However, if --signing-helper is
-    /// used, then it should be a public key instead.
+    /// used, then it should be a public key instead. This is not required if
+    /// --disable-avb is used.
     #[arg(
         long,
         alias = "privkey-avb",
         value_name = "FILE",
         value_parser,
+        required_unless_present = "disable_avb",
         help_heading = HEADING_KEY,
     )]
-    pub key_avb: PathBuf,
+    pub key_avb: Option<PathBuf>,
 
     /// Signing key for the OTA.
     ///
@@ -2634,6 +2702,19 @@ pub struct PatchCli {
     /// Forcibly clear vbmeta flags if they disable AVB.
     #[arg(long, help_heading = HEADING_OTHER)]
     pub clear_vbmeta_flags: bool,
+
+    /// Disable AVB verification entirely.
+    ///
+    /// The root vbmeta image's flags will be set to disable both hashtree
+    /// verification and AVB verification, and it will be left unsigned. No
+    /// partitions will be re-signed and --key-avb is not required. Note that
+    /// this does not affect the payload hashes verified by update_engine.
+    #[arg(
+        long,
+        conflicts_with = "clear_vbmeta_flags",
+        help_heading = HEADING_OTHER,
+    )]
+    pub disable_avb: bool,
 
     /// Override the virtual A/B CoW compression algorithm.
     ///

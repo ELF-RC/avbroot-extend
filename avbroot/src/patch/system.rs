@@ -11,7 +11,7 @@ use memchr::memmem;
 use rawzip::ZipArchive;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use thiserror::Error;
-use tracing::{Span, debug, debug_span, trace};
+use tracing::{Span, debug, debug_span, info, trace};
 use x509_cert::Certificate;
 
 use crate::{
@@ -113,7 +113,7 @@ fn find_zip_bounds(data: &[u8], eocd_offset: usize) -> Option<Range<usize>> {
 pub fn patch_system_image(
     raw_file: &(dyn ReadWriteAt + Sync),
     certificate: &Certificate,
-    key: &SigningPrivateKey,
+    key: Option<&SigningPrivateKey>,
     method: SigningMethod,
     cancel_signal: &AtomicBool,
 ) -> Result<(Vec<Range<u64>>, Vec<Range<u64>>)> {
@@ -124,18 +124,27 @@ pub fn patch_system_image(
 
     let parent_span = Span::current();
 
-    let (mut header, footer, image_size) =
-        avb::load_image(UserPosFile::new(raw_file)).map_err(Error::AvbUpdate)?;
-    let Some(mut footer) = footer else {
-        return Err(Error::NoFooter);
-    };
-    let AppendedDescriptorMut::HashTree(descriptor) =
-        header.appended_descriptor_mut().map_err(Error::AvbUpdate)?
-    else {
-        return Err(Error::NoHashTreeDescriptor);
+    let (mut header, footer, image_size) = match avb::load_image(UserPosFile::new(raw_file)) {
+        Ok(result) => (Some(result.0), result.1, result.2),
+        Err(e) if key.is_none() => {
+            // AVB is disabled, so the image may not have a vbmeta footer or
+            // header. Fall back to searching the entire image for
+            // otacerts.zip.
+            info!("Loading system image without AVB footer");
+            let image_size = UserPosFile::new(raw_file)
+                .seek(SeekFrom::End(0))
+                .map_err(Error::ReadData)?;
+            (None, None, image_size)
+        }
+        Err(e) => return Err(Error::AvbUpdate(e)),
     };
 
-    let num_chunks = footer.original_image_size.div_ceil(CHUNK_SIZE);
+    let search_size = footer
+        .as_ref()
+        .map(|f| f.original_image_size)
+        .unwrap_or(image_size);
+
+    let num_chunks = search_size.div_ceil(CHUNK_SIZE);
     trace!("Parallel heuristics search for otacerts.zip with {num_chunks} chunks");
 
     let modified_ranges = (0..num_chunks)
@@ -144,7 +153,7 @@ pub fn patch_system_image(
             stream::check_cancel(cancel_signal).map_err(Error::ReadData)?;
 
             let offset = chunk * CHUNK_SIZE;
-            let size = CHUNK_SIZE.min(footer.original_image_size - offset);
+            let size = CHUNK_SIZE.min(search_size - offset);
 
             let mut file = UserPosFile::new(raw_file);
             file.seek(SeekFrom::Start(offset))
@@ -189,15 +198,38 @@ pub fn patch_system_image(
         return Err(Error::OldZipNotFound);
     }
 
+    if key.is_none() {
+        // AVB is disabled, so there's no need to update the hash tree, FEC
+        // data, or AVB metadata. The bootloader skips all AVB verification
+        // because the vbmeta flags are set accordingly, so the stale root
+        // digest in the image's own header (if any) doesn't matter.
+        info!("Patching system image without AVB metadata updates");
+        return Ok((modified_ranges, Vec::new()));
+    }
+
+    // AVB is enabled, so the image must have a vbmeta footer.
+    let Some(mut footer) = footer else {
+        return Err(Error::NoFooter);
+    };
+    let mut header = header.unwrap();
+
     // Only need to update the hash tree and FEC data corresponding to the
     // modified regions.
     let update_ranges = Some(modified_ranges.as_slice());
+
+    let AppendedDescriptorMut::HashTree(descriptor) =
+        header.appended_descriptor_mut().map_err(Error::AvbUpdate)?
+    else {
+        return Err(Error::NoHashTreeDescriptor);
+    };
 
     descriptor
         .update(raw_file, update_ranges, cancel_signal)
         .map_err(Error::AvbUpdate)?;
 
-    if !header.public_key.is_empty() {
+    if let Some(key) = key
+        && !header.public_key.is_empty()
+    {
         debug!("Signing system image");
         header
             .set_algo_for_key(key, false)

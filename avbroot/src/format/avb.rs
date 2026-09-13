@@ -1542,6 +1542,26 @@ impl fmt::Debug for Header {
     }
 }
 
+impl Default for Header {
+    fn default() -> Self {
+        Self {
+            required_libavb_version_major: 1,
+            required_libavb_version_minor: 0,
+            algorithm_type: AlgorithmType::None,
+            hash: Vec::new(),
+            signature: Vec::new(),
+            public_key: Vec::new(),
+            public_key_metadata: Vec::new(),
+            descriptors: Vec::new(),
+            rollback_index: 0,
+            flags: 0,
+            rollback_index_location: 0,
+            release_string: "avbroot".to_owned(),
+            reserved: [0; 80],
+        }
+    }
+}
+
 impl Header {
     pub const FLAG_HASHTREE_DISABLED: u32 = 1 << 0;
     pub const FLAG_VERIFICATION_DISABLED: u32 = 1 << 1;
