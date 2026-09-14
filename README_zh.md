@@ -6,6 +6,23 @@
 
 AVBROOT Extend 是原版 avbroot 的扩展版本，支持更多功能和命令行参数。
 
+## 新增功能
+
+AVBROOT Extend 新增的功能位于 `ota patch`：
+
+```text
+avbroot
+└── ota
+    └── patch
+        ├── --disable-avb
+        ├── --add-partition <PARTITION> <FILE> [SIZE]   可重复
+        └── --dynamic-partition <PARTITION>             可重复
+```
+
+- `--disable-avb`：关闭根 `vbmeta` 镜像中的 AVB 验证和 hashtree 验证，因此可以省略 `--key-avb`。OTA payload 本身仍会正常签名。
+- `--add-partition <PARTITION> <FILE> [SIZE]`：将完整分区镜像作为新的 payload `PartitionUpdate` 添加进去。参数可重复；指定 `SIZE` 时，会用零填充镜像到该大小。
+- `--dynamic-partition <PARTITION>`：将分区名写入 payload 元数据中的第一个 `DynamicPartitionGroup`。参数可重复，并且每个名称都必须与 `--add-partition` 提供的某个 `PARTITION` 匹配。该参数用于新增逻辑分区。
+
 ## 命令树
 
 以下命令树根据当前源码 `avbroot/src/cli` 中的 Clap 命令定义整理。
@@ -207,6 +224,7 @@ avbroot
 │   │   ├── --signing-method <METHOD>
 │   │   ├── --replace <PARTITION> <FILE>              可重复
 │   │   ├── --add-partition <PARTITION> <FILE> [SIZE] 可重复
+│   │   ├── --dynamic-partition <PARTITION>          可重复；需要 --add-partition
 │   │   ├── --re-sign <PARTITION>                    可重复
 │   │   ├── 以下三者必须选择一个：--magisk <FILE>
 │   │   │                       或 --prepatched <FILE>

@@ -6,6 +6,23 @@ Original project: <https://github.com/chenxiaolong/avbroot>
 
 AVBROOT Extend is an extended version of the original avbroot with support for more features and command-line options.
 
+## Added features
+
+The features added by AVBROOT Extend are available under `ota patch`:
+
+```text
+avbroot
+└── ota
+    └── patch
+        ├── --disable-avb
+        ├── --add-partition <PARTITION> <FILE> [SIZE]   repeatable
+        └── --dynamic-partition <PARTITION>             repeatable
+```
+
+- `--disable-avb`: disables AVB verification and hashtree verification in the root `vbmeta` image, allowing `--key-avb` to be omitted. The OTA payload is still signed normally.
+- `--add-partition <PARTITION> <FILE> [SIZE]`: adds a full partition image as a new payload `PartitionUpdate`. It can be repeated; when `SIZE` is specified, the image is zero-padded to that size.
+- `--dynamic-partition <PARTITION>`: adds the partition name to the first `DynamicPartitionGroup` in the payload metadata. It can be repeated, and every name must match a `PARTITION` supplied to `--add-partition`. This is intended for newly added logical partitions.
+
 ## Command tree
 
 The following tree is generated from the current Clap command definitions in `avbroot/src/cli`.
@@ -207,6 +224,7 @@ avbroot
 │   │   ├── --signing-method <METHOD>
 │   │   ├── --replace <PARTITION> <FILE>              repeatable
 │   │   ├── --add-partition <PARTITION> <FILE> [SIZE] repeatable
+│   │   ├── --dynamic-partition <PARTITION>          repeatable; requires --add-partition
 │   │   ├── --re-sign <PARTITION>                    repeatable
 │   │   ├── exactly one of: --magisk <FILE>
 │   │   │              or: --prepatched <FILE>

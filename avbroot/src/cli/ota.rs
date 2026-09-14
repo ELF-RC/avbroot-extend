@@ -1042,6 +1042,7 @@ fn patch_ota_payload(
     writer: impl Write,
     external_images: &HashMap<String, PathBuf>,
     add_partitions: &HashMap<String, (PathBuf, Option<u64>)>,
+    dynamic_partitions: &[String],
     re_sign_images: &HashSet<String>,
     boot_patchers: &[Box<dyn BootImagePatch + Sync>],
     skip_system_ota_cert: bool,
@@ -1069,13 +1070,37 @@ fn patch_ota_payload(
     {
         required_flags |= RequiredFlags::ALL_COW;
     }
-
     let all_partitions = header
         .manifest
         .partitions
         .iter()
-        .map(|p| p.partition_name.as_str())
+        .map(|p| p.partition_name.clone())
         .collect::<HashSet<_>>();
+
+    for name in dynamic_partitions {
+        if !add_partitions.contains_key(name) {
+            bail!(
+                "Cannot add dynamic partition {name} without a matching --add-partition argument"
+            );
+        }
+    }
+
+    if !dynamic_partitions.is_empty() {
+        let Some(dpm) = &mut header.manifest.dynamic_partition_metadata else {
+            bail!(
+                "Cannot add dynamic partitions because payload has no dynamic partition metadata"
+            );
+        };
+        let Some(group) = dpm.groups.first_mut() else {
+            bail!("Cannot add dynamic partitions because payload has no dynamic partition group");
+        };
+
+        for name in dynamic_partitions {
+            if !group.partition_names.contains(name) {
+                group.partition_names.push(name.clone());
+            }
+        }
+    }
 
     // Use external partition images if provided. This may be a larger set than
     // what's needed for our patches.
@@ -1413,6 +1438,7 @@ fn patch_ota_zip(
     zip_writer: &mut ZipArchiveWriter<impl Write>,
     external_images: &HashMap<String, PathBuf>,
     add_partitions: &HashMap<String, (PathBuf, Option<u64>)>,
+    dynamic_partitions: &[String],
     re_sign_images: &HashSet<String>,
     boot_patchers: &[Box<dyn BootImagePatch + Sync>],
     skip_system_ota_cert: bool,
@@ -1617,6 +1643,7 @@ fn patch_ota_zip(
                     &mut data_writer,
                     external_images,
                     add_partitions,
+                    dynamic_partitions,
                     re_sign_images,
                     boot_patchers,
                     skip_system_ota_cert,
@@ -1961,6 +1988,7 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
         &mut zip_writer,
         &external_images,
         &add_partitions,
+        &cli.dynamic_partition,
         &re_sign_images,
         &boot_patchers,
         cli.skip_system_ota_cert,
@@ -2756,6 +2784,17 @@ pub struct PatchCli {
         help_heading = HEADING_PATH,
     )]
     pub add_partition: Vec<Vec<OsString>>,
+
+    /// Add the partition to the first dynamic partition group in the payload.
+    ///
+    /// Each partition must also be specified with --add-partition.
+    #[arg(
+        long,
+        value_name = "PARTITION",
+        requires = "add_partition",
+        help_heading = HEADING_PATH,
+    )]
+    pub dynamic_partition: Vec<String>,
 
     /// Re-sign unmodified partition image.
     ///
