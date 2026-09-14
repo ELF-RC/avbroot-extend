@@ -1,6 +1,6 @@
 ### AVBROOT Extend
 
-[English] | [中文](README_zh.md)
+English | [中文](README_zh.md)
 
 Original project: <https://github.com/chenxiaolong/avbroot>
 
