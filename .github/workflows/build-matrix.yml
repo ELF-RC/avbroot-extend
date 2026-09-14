@@ -1,0 +1,105 @@
+name: Build matrix
+on:
+  workflow_dispatch:
+
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-matrix-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Ubuntu 22.04 ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Show build environment
+        run: |
+          mkdir -p ci-logs
+          {
+            echo "runner_name=${RUNNER_NAME}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "nproc=$(nproc)"
+          } | tee ci-logs/environment.log
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          mkdir -p ci-logs
+          echo 'cargo build --release --jobs "$(nproc)" --locked' > ci-logs/cargo-command.log
+          cargo build --release --jobs "$(nproc)" --locked > ci-logs/cargo-build-release.log 2>&1
+
+      - name: Collect logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p ci-logs
+          {
+            echo '=== git status ==='
+            git status --short --branch
+            echo '=== git log ==='
+            git log -5 --oneline --decorate
+            echo '=== workspace files ==='
+            find . -maxdepth 3 -type f -not -path './.git/*' -not -path './target/*' | sort
+            echo '=== target files ==='
+            find target -type f -printf '%p %s bytes\\n' 2>/dev/null | sort || true
+          } > ci-logs/collection.log 2>&1
+
+      - name: Upload complete workspace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-${{ matrix.arch }}
+          path: .
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.arch }}
+          path: target/release
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload avbroot binary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: avbroot-${{ matrix.arch }}
+          path: target/release/avbroot
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload all logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.arch }}
+          path: ci-logs
+          if-no-files-found: warn
+          retention-days: 14
