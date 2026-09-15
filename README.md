@@ -16,12 +16,14 @@ avbroot
     └── patch
         ├── --disable-avb
         ├── --add-partition <PARTITION> <FILE> [SIZE]   repeatable
-        └── --dynamic-partition <PARTITION>             repeatable
+        ├── --dynamic-partition <PARTITION>             repeatable
+        └── --delete-partition <PARTITION>              repeatable
 ```
 
 - `--disable-avb`: disables AVB verification and hashtree verification in the root `vbmeta` image, allowing `--key-avb` to be omitted. The OTA payload is still signed normally.
 - `--add-partition <PARTITION> <FILE> [SIZE]`: adds a full partition image as a new payload `PartitionUpdate`. It can be repeated; when `SIZE` is specified, the image is zero-padded to that size.
 - `--dynamic-partition <PARTITION>`: adds the partition name to the first `DynamicPartitionGroup` in the payload metadata. It can be repeated, and every name must match a `PARTITION` supplied to `--add-partition`. This is intended for newly added logical partitions.
+- `--delete-partition <PARTITION>`: removes the partition's `PartitionUpdate` from the payload. For logical partitions, it also removes the name from every dynamic partition group; for static partitions, it only stops the OTA from flashing that partition. It can be repeated.
 
 ## Command tree
 
@@ -224,6 +226,7 @@ avbroot
 │   │   ├── --signing-method <METHOD>
 │   │   ├── --replace <PARTITION> <FILE>              repeatable
 │   │   ├── --add-partition <PARTITION> <FILE> [SIZE] repeatable
+│   │   ├── --delete-partition <PARTITION>           repeatable
 │   │   ├── --dynamic-partition <PARTITION>          repeatable; requires --add-partition
 │   │   ├── --re-sign <PARTITION>                    repeatable
 │   │   ├── exactly one of: --magisk <FILE>

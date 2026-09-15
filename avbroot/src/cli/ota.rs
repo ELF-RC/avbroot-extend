@@ -244,6 +244,11 @@ fn patch_boot_images(
         .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>();
 
+    if boot_partitions.is_empty() {
+        info!("No boot images remain in the payload; skipping boot image patching");
+        return Ok(());
+    }
+
     info!(
         "Candidate boot images: {}",
         util::join(util::sort(boot_partitions.iter()), ", "),
@@ -798,6 +803,7 @@ fn update_vbmeta_headers(
     images: &mut HashMap<String, InputFile>,
     headers: &mut HashMap<String, Header>,
     order: &mut [(String, HashSet<String>)],
+    deleted_dynamic_partitions: &HashSet<String>,
     clear_vbmeta_flags: bool,
     disable_avb: bool,
     key: Option<&SigningPrivateKey>,
@@ -826,6 +832,11 @@ fn update_vbmeta_headers(
                 );
             }
         }
+
+        parent_header.descriptors.retain(|d| {
+            d.partition_name()
+                .is_none_or(|name| !deleted_dynamic_partitions.contains(name))
+        });
 
         for dep in deps.iter() {
             if disable_avb {
@@ -1036,6 +1047,59 @@ pub fn recow_image(
     Ok(())
 }
 
+/// Remove partitions from the payload manifest. Dynamic partitions are also
+/// removed from every dynamic partition group; static partitions are only
+/// removed from the list of payload updates.
+fn delete_partitions_from_manifest(
+    header: &mut PayloadHeader,
+    names: &[String],
+) -> Result<HashSet<String>> {
+    let requested = names.iter().cloned().collect::<HashSet<_>>();
+    if requested.len() != names.len() {
+        bail!("A partition cannot be deleted more than once");
+    }
+
+    let existing = header
+        .manifest
+        .partitions
+        .iter()
+        .map(|p| p.partition_name.clone())
+        .collect::<HashSet<_>>();
+    let missing = requested.difference(&existing).cloned().collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "Cannot delete non-existent payload partitions: {}",
+            util::join(missing, ", ")
+        );
+    }
+
+    let deleted_dynamic = header
+        .manifest
+        .dynamic_partition_metadata
+        .as_ref()
+        .into_iter()
+        .flat_map(|dpm| dpm.groups.iter())
+        .flat_map(|group| group.partition_names.iter())
+        .filter(|name| requested.contains(*name))
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    header
+        .manifest
+        .partitions
+        .retain(|p| !requested.contains(&p.partition_name));
+
+    if let Some(dpm) = &mut header.manifest.dynamic_partition_metadata {
+        for group in &mut dpm.groups {
+            group
+                .partition_names
+                .retain(|name| !requested.contains(name));
+        }
+    }
+
+    Ok(deleted_dynamic)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn patch_ota_payload(
     payload: &(dyn ReadAt + Sync),
@@ -1043,6 +1107,7 @@ fn patch_ota_payload(
     external_images: &HashMap<String, PathBuf>,
     add_partitions: &HashMap<String, (PathBuf, Option<u64>)>,
     dynamic_partitions: &[String],
+    delete_partition_names: &[String],
     re_sign_images: &HashSet<String>,
     boot_patchers: &[Box<dyn BootImagePatch + Sync>],
     skip_system_ota_cert: bool,
@@ -1062,9 +1127,6 @@ fn patch_ota_payload(
     }
 
     let mut required_flags = RequiredFlags::empty();
-    if !skip_system_ota_cert {
-        required_flags |= RequiredFlags::SYSTEM;
-    }
     if let Some(vabc_algo) = vabc_algo_override
         && set_vabc_algo(&mut header, vabc_algo)?
     {
@@ -1076,6 +1138,31 @@ fn patch_ota_payload(
         .iter()
         .map(|p| p.partition_name.clone())
         .collect::<HashSet<_>>();
+    let delete_partitions = delete_partition_names
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let conflicting_partitions = add_partitions
+        .keys()
+        .chain(external_images.keys())
+        .chain(re_sign_images.iter())
+        .chain(dynamic_partitions.iter())
+        .filter(|name| delete_partitions.contains(*name))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !conflicting_partitions.is_empty() {
+        bail!(
+            "Partition cannot be deleted and modified at the same time: {}",
+            util::join(conflicting_partitions, ", ")
+        );
+    }
+
+    let deleted_dynamic_partitions =
+        delete_partitions_from_manifest(&mut header, delete_partition_names)?;
+
+    if !skip_system_ota_cert && !delete_partitions.contains("system") {
+        required_flags |= RequiredFlags::SYSTEM;
+    }
 
     for name in dynamic_partitions {
         if !add_partitions.contains_key(name) {
@@ -1160,7 +1247,7 @@ fn patch_ota_payload(
         cancel_signal,
     )?;
 
-    let system_result = if skip_system_ota_cert {
+    let system_result = if skip_system_ota_cert || delete_partitions.contains("system") {
         None
     } else {
         Some(patch_system_image(
@@ -1192,6 +1279,7 @@ fn patch_ota_payload(
         &mut input_files,
         &mut vbmeta_headers,
         &mut vbmeta_order,
+        &deleted_dynamic_partitions,
         clear_vbmeta_flags,
         disable_avb,
         key_avb,
@@ -1286,22 +1374,23 @@ fn patch_ota_payload(
         added_compressed_files.insert(name.clone(), (input_file, vec![ops_range]));
     }
 
-    let care_map = if disable_avb {
-        None
-    } else {
-        let overrides = input_files
-            .iter()
-            .map(|(name, f)| (name.as_str(), &f.file as &(dyn ReadAt + Sync)))
-            .chain(
-                added_raw_files
-                    .iter()
-                    .map(|(name, file)| (name.as_str(), &**file as &(dyn ReadAt + Sync))),
-            );
-        Some(
-            care_map::generate_care_map(payload, overrides, &header, cancel_signal)
-                .context("Failed to generate new care map")?,
-        )
-    };
+    let care_map =
+        if disable_avb && dynamic_partitions.is_empty() && deleted_dynamic_partitions.is_empty() {
+            None
+        } else {
+            let overrides = input_files
+                .iter()
+                .map(|(name, f)| (name.as_str(), &f.file as &(dyn ReadAt + Sync)))
+                .chain(
+                    added_raw_files
+                        .iter()
+                        .map(|(name, file)| (name.as_str(), &**file as &(dyn ReadAt + Sync))),
+                );
+            Some(
+                care_map::generate_care_map(payload, overrides, &header, cancel_signal)
+                    .context("Failed to generate new care map")?,
+            )
+        };
 
     // Drop all unmodified images. We only want to compress modified images.
     // For recowed images, the payload header was already updated with the new
@@ -1439,6 +1528,7 @@ fn patch_ota_zip(
     external_images: &HashMap<String, PathBuf>,
     add_partitions: &HashMap<String, (PathBuf, Option<u64>)>,
     dynamic_partitions: &[String],
+    delete_partition_names: &[String],
     re_sign_images: &HashSet<String>,
     boot_patchers: &[Box<dyn BootImagePatch + Sync>],
     skip_system_ota_cert: bool,
@@ -1644,6 +1734,7 @@ fn patch_ota_zip(
                     external_images,
                     add_partitions,
                     dynamic_partitions,
+                    delete_partition_names,
                     re_sign_images,
                     boot_patchers,
                     skip_system_ota_cert,
@@ -1989,6 +2080,7 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
         &external_images,
         &add_partitions,
         &cli.dynamic_partition,
+        &cli.delete_partition,
         &re_sign_images,
         &boot_patchers,
         cli.skip_system_ota_cert,
@@ -2784,6 +2876,13 @@ pub struct PatchCli {
         help_heading = HEADING_PATH,
     )]
     pub add_partition: Vec<Vec<OsString>>,
+
+    /// Remove a partition update from the payload.
+    ///
+    /// Dynamic partitions are also removed from their dynamic partition groups;
+    /// static partitions are only omitted from OTA flashing.
+    #[arg(long, value_name = "PARTITION", help_heading = HEADING_PATH)]
+    pub delete_partition: Vec<String>,
 
     /// Add the partition to the first dynamic partition group in the payload.
     ///
