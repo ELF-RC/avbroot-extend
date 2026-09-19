@@ -25,6 +25,11 @@ avbroot
 - `--dynamic-partition <PARTITION>`: adds the partition name to the first `DynamicPartitionGroup` in the payload metadata. It can be repeated, and every name must match a `PARTITION` supplied to `--add-partition`. This is intended for newly added logical partitions.
 - `--delete-partition <PARTITION>`: removes the partition's `PartitionUpdate` from the payload. For logical partitions, it also removes the name from every dynamic partition group; for static partitions, it only stops the OTA from flashing that partition. It can be repeated.
 
+## Contributors
+- [ELF-RC](https://github.com/ELF-RC)
+- [ChuiShui233](https://github.com/ChuiShui233)
+- [chengxiaolong](https://github.com/chengxiaolong)
+
 ## Command tree
 
 The following tree is generated from the current Clap command definitions in `avbroot/src/cli`.

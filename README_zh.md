@@ -25,6 +25,11 @@ avbroot
 - `--dynamic-partition <PARTITION>`：将分区名写入 payload 元数据中的第一个 `DynamicPartitionGroup`。参数可重复，并且每个名称都必须与 `--add-partition` 提供的某个 `PARTITION` 匹配。该参数用于新增逻辑分区。
 - `--delete-partition <PARTITION>`：从 payload 中删除该分区的 `PartitionUpdate`。对于逻辑分区，还会从所有动态分区组中删除该名称；对于静态分区，只是不再由 OTA 刷写该分区。参数可重复。
 
+## 贡献者
+- [ELF-RC](https://github.com/ELF-RC)
+- [ChuiShui233](https://github.com/ChuiShui233)
+- [chengxiaolong](https://github.com/chengxiaolong)
+
 ## 命令树
 
 以下命令树根据当前源码 `avbroot/src/cli` 中的 Clap 命令定义整理。
