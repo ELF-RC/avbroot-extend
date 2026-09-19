@@ -28,7 +28,7 @@ avbroot
 ## 贡献者
 - [ELF-RC](https://github.com/ELF-RC)
 - [ChuiShui233](https://github.com/ChuiShui233)
-- [chengxiaolong](https://github.com/chengxiaolong)
+- [chenxiaolong](https://github.com/chenxiaolong)
 
 ## 命令树
 
