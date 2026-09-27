@@ -249,6 +249,7 @@ pub fn pack_payload(
             &mut UserPosFile::new(input_file),
             header.manifest.block_size(),
             name,
+            None,
         )?;
         care_map.partitions.push(partition_info);
     }

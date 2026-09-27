@@ -28,8 +28,6 @@ pub enum Error {
     MissingPartition(String),
     #[error("No hash tree descriptor found in AVB header: {0}")]
     NoHashTreeDescriptor(String),
-    #[error("No property descriptor found in AVB header: {partition}: {property}")]
-    NoPropertyDescriptor { partition: String, property: String },
     #[error("Failed to extract payload operation #{1}: {0}")]
     Extract(String, usize, #[source] payload::Error),
     #[error("Failed to load AVB header from image: {0}")]
@@ -159,6 +157,7 @@ pub fn generate_partition_info(
     reader: &mut dyn ReadSeek,
     block_size: u32,
     partition_name: &str,
+    override_fingerprint: Option<&str>,
 ) -> Result<PartitionInfo> {
     let (avb_header, _, _) =
         avb::load_image(reader).map_err(|e| Error::AvbLoad(partition_name.to_owned(), e))?;
@@ -170,7 +169,25 @@ pub fn generate_partition_info(
         return Err(Error::NoHashTreeDescriptor(partition_name.to_owned()));
     };
 
+    let image_blocks = hash_tree.image_size / u64::from(block_size);
+
+    // An externally provided fingerprint overrides the value read from the
+    // AVB header. This is useful for partition images that carry no property
+    // descriptors at all.
+    if let Some(fingerprint) = override_fingerprint {
+        return Ok(PartitionInfo {
+            name: partition_name.to_owned(),
+            ranges: format!("2,0,{image_blocks}"),
+            id: format!("ro.{partition_name}.build.fingerprint"),
+            fingerprint: fingerprint.to_owned(),
+        });
+    }
+
     let property = format!("com.android.build.{partition_name}.fingerprint");
+
+    // Some vendors (and GSI images) ship partition images whose vbmeta headers
+    // carry no property descriptors at all. update_engine only needs the
+    // partition id and ranges; an empty fingerprint is tolerated.
     let fingerprint = avb_header
         .descriptors
         .iter()
@@ -183,12 +200,7 @@ pub fn generate_partition_info(
                 None
             }
         })
-        .ok_or_else(|| Error::NoPropertyDescriptor {
-            partition: partition_name.to_owned(),
-            property,
-        })?;
-
-    let image_blocks = hash_tree.image_size / u64::from(block_size);
+        .unwrap_or_default();
 
     Ok(PartitionInfo {
         name: partition_name.to_owned(),
@@ -205,6 +217,7 @@ fn generate_partition_info_payload(
     payload: &mut dyn ReadSeek,
     header: &PayloadHeader,
     partition_name: &str,
+    override_fingerprint: Option<&str>,
     cancel_signal: &AtomicBool,
 ) -> Result<PartitionInfo> {
     let partition = header
@@ -292,6 +305,7 @@ fn generate_partition_info_payload(
         &mut partial_file,
         header.manifest.block_size(),
         partition_name,
+        override_fingerprint,
     )
 }
 
@@ -301,6 +315,7 @@ pub fn generate_care_map<'name, 'file>(
     payload: &(dyn ReadAt + Sync),
     overrides: impl IntoIterator<Item = (&'name str, &'file (dyn ReadAt + Sync))>,
     header: &PayloadHeader,
+    fingerprint_overrides: &HashMap<String, String>,
     cancel_signal: &AtomicBool,
 ) -> Result<CareMap> {
     let overrides = overrides.into_iter().collect::<HashMap<_, _>>();
@@ -310,12 +325,26 @@ pub fn generate_care_map<'name, 'file>(
             .par_iter()
             .flat_map(|g| &g.partition_names)
             .map(|name| -> Result<PartitionInfo> {
+                let fingerprint_override = fingerprint_overrides
+                    .get(name.as_str())
+                    .map(|v| v.as_str());
                 if let Some(&file) = overrides.get(name.as_str()) {
                     let mut reader = UserPosFile::new(file);
-                    generate_partition_info(&mut reader, header.manifest.block_size(), name)
+                    generate_partition_info(
+                        &mut reader,
+                        header.manifest.block_size(),
+                        name,
+                        fingerprint_override,
+                    )
                 } else {
                     let mut reader = UserPosFile::new(payload);
-                    generate_partition_info_payload(&mut reader, header, name, cancel_signal)
+                    generate_partition_info_payload(
+                        &mut reader,
+                        header,
+                        name,
+                        fingerprint_override,
+                        cancel_signal,
+                    )
                 }
             })
             .collect::<Result<Vec<_>>>()?
