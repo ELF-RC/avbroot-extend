@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
-    collections::HashMap,
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{BufReader, Seek, Write},
@@ -429,7 +428,7 @@ fn pack_subcommand(zip_cli: &ZipCli, cli: &PackCli, cancel_signal: &AtomicBool) 
 
                 if header.is_full_ota() {
                     care_map = Some(
-                        care_map::generate_care_map(&input_file, [], &header, &HashMap::new(), cancel_signal)
+                        care_map::generate_care_map(&input_file, [], &header, cancel_signal)
                             .context("Failed to generate new care map")?,
                     );
                 }
@@ -515,7 +514,7 @@ fn repack_subcommand(zip_cli: &ZipCli, cli: &RepackCli, cancel_signal: &AtomicBo
 
             if header.is_full_ota() {
                 care_map = Some(
-                    care_map::generate_care_map(&payload_reader, [], &header, &HashMap::new(), cancel_signal)
+                    care_map::generate_care_map(&payload_reader, [], &header, cancel_signal)
                         .context("Failed to generate new care map")?,
                 );
             }

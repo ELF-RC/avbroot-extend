@@ -1114,7 +1114,6 @@ fn patch_ota_payload(
     clear_vbmeta_flags: bool,
     disable_avb: bool,
     vabc_algo_override: Option<VabcAlgo>,
-    fingerprint_overrides: &HashMap<String, String>,
     key_avb: Option<&SigningPrivateKey>,
     key_ota: &SigningPrivateKey,
     cert_ota: &Certificate,
@@ -1388,14 +1387,8 @@ fn patch_ota_payload(
                         .map(|(name, file)| (name.as_str(), &**file as &(dyn ReadAt + Sync))),
                 );
             Some(
-                care_map::generate_care_map(
-                    payload,
-                    overrides,
-                    &header,
-                    fingerprint_overrides,
-                    cancel_signal,
-                )
-                .context("Failed to generate new care map")?,
+                care_map::generate_care_map(payload, overrides, &header, cancel_signal)
+                    .context("Failed to generate new care map")?,
             )
         };
 
@@ -1542,7 +1535,6 @@ fn patch_ota_zip(
     clear_vbmeta_flags: bool,
     disable_avb: bool,
     vabc_algo_override: Option<VabcAlgo>,
-    fingerprint_overrides: &HashMap<String, String>,
     zip_mode: ZipMode,
     key_avb: Option<&SigningPrivateKey>,
     key_ota: &SigningPrivateKey,
@@ -1749,7 +1741,6 @@ fn patch_ota_zip(
                     clear_vbmeta_flags,
                     disable_avb,
                     vabc_algo_override,
-                    fingerprint_overrides,
                     key_avb,
                     key_ota,
                     cert_ota,
@@ -2091,19 +2082,6 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
     };
     let mut zip_writer = ZipArchiveWriter::new(signing_writer);
 
-    let mut fingerprint_overrides = HashMap::new();
-
-    for item in &cli.fingerprint {
-        let name = item[0]
-            .to_str()
-            .ok_or_else(|| anyhow!("Invalid partition name: {:?}", item[0]))?;
-        let fingerprint = item[1]
-            .to_str()
-            .ok_or_else(|| anyhow!("Invalid fingerprint: {:?}", item[1]))?;
-
-        fingerprint_overrides.insert(name.to_owned(), fingerprint.to_owned());
-    }
-
     let (metadata, payload_metadata_size) = patch_ota_zip(
         &raw_reader,
         &zip_reader,
@@ -2118,7 +2096,6 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
         cli.clear_vbmeta_flags,
         cli.disable_avb,
         cli.vabc_algo,
-        &fingerprint_overrides,
         cli.zip_mode,
         key_avb.as_ref(),
         &key_ota,
@@ -2674,7 +2651,7 @@ pub fn verify_subcommand(cli: &VerifyCli, cancel_signal: &AtomicBool) -> Result<
         care_map::normalize(care_map);
 
         let expected =
-            care_map::generate_care_map(&payload_reader, [], &ota_info.header, &HashMap::new(), cancel_signal)
+            care_map::generate_care_map(&payload_reader, [], &ota_info.header, cancel_signal)
                 .context("Failed to compute expected care map")?;
 
         if *care_map != expected {
@@ -2939,16 +2916,6 @@ pub struct PatchCli {
     /// embedded in another signed vbmeta image, then this option is a no-op.
     #[arg(long, value_names = ["PARTITION"], help_heading = HEADING_PATH)]
     pub re_sign: Vec<String>,
-
-    /// Use the specified fingerprint instead of reading it from the
-    /// `com.android.build.<partition>.fingerprint` property descriptor of
-    /// the partition's AVB metadata when generating the care map.
-    ///
-    /// This can be repeated for multiple partitions. Partitions without an
-    /// override still fall back to the value read from the AVB metadata
-    /// (or an empty fingerprint if the property descriptor is missing).
-    #[arg(long, value_names = ["PARTITION", "FINGERPRINT"], help_heading = HEADING_OTHER)]
-    pub fingerprint: Vec<Vec<OsString>>,
 
     #[command(flatten)]
     pub root: RootGroup,
