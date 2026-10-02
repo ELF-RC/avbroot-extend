@@ -1909,6 +1909,15 @@ pub fn patch_subcommand(cli: &PatchCli, cancel_signal: &AtomicBool) -> Result<()
         warn!("Ignoring --boot-partition: deprecated and no longer needed");
     }
 
+    if let Some(temp_dir) = &cli.temp_dir {
+        fs::create_dir_all(temp_dir)
+            .with_context(|| format!("Failed to create temporary directory: {temp_dir:?}"))?;
+        // SAFETY: Setting TMPDIR is process-local and is only done once during
+        // startup before any threads read the variable. It is used by the
+        // tempfile crate to determine where to place temporary files.
+        unsafe { std::env::set_var("TMPDIR", temp_dir) };
+    }
+
     let output = cli.output.as_ref().map_or_else(
         || {
             let mut s = cli.input.clone().into_os_string();
@@ -3048,6 +3057,14 @@ pub struct PatchCli {
         help_heading = HEADING_OTHER,
     )]
     pub zip_mode: ZipMode,
+
+    /// Directory to use for temporary files.
+    ///
+    /// By default, temporary files are stored in the directory specified by the
+    /// TMPDIR environment variable, or the system default if TMPDIR is unset.
+    /// This option overrides that value.
+    #[arg(long, value_name = "DIR", value_parser, help_heading = HEADING_OTHER)]
+    pub temp_dir: Option<PathBuf>,
 
     /// (Deprecated: no longer needed)
     #[arg(
