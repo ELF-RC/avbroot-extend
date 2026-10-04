@@ -87,6 +87,40 @@ jobs:
           ls -lh /tmp/input-img/
           df -h /
 
+      - name: Build signed extra_part image
+        run: |
+          # Extract mi_ext (small hashtree partition) as a template, then
+          # repack it as extra_part with a signed AVB footer + property
+          # descriptors. blank.img has no AVB footer, so it cannot be used
+          # with --dynamic-partition (care_map generation reads the footer).
+          mkdir -p /tmp/extra-tmpl
+          /tmp/avbroot ota extract \
+            --input /tmp/ota/miui.zip \
+            --directory /tmp/extra-tmpl \
+            --partition mi_ext 2>&1 | tee /tmp/logs/extract-mi_ext.log
+
+          cd /tmp/extra-tmpl
+          /tmp/avbroot avb unpack -i mi_ext.img \
+            --output-info extra.toml --output-raw extra.raw 2>&1 | tee /tmp/logs/unpack-mi_ext.log
+
+          # Rewrite partition_name and property keys to extra_part.
+          python3 - <<'PY'
+          s = open('extra.toml').read()
+          s = s.replace('partition_name = "mi_ext"', 'partition_name = "extra_part"')
+          s = s.replace('com.android.build.mi_ext.', 'com.android.build.extra_part.')
+          open('extra.toml', 'w').write(s)
+          PY
+
+          /tmp/avbroot avb pack -o /tmp/input-img/extra_part.img \
+            --input-info extra.toml --input-raw extra.raw \
+            -k /tmp/keys/avb.key --pass-file /tmp/keys/passphrase.txt \
+            2>&1 | tee /tmp/logs/pack-extra_part.log
+
+          echo "=== extra_part.img info ==="
+          /tmp/avbroot avb info -i /tmp/input-img/extra_part.img 2>&1 | tee -a /tmp/logs/pack-extra_part.log
+          ls -lh /tmp/input-img/extra_part.img
+          df -h /
+
       - name: Run OTA patch test suite
         shell: bash
         run: |

@@ -184,9 +184,14 @@ echo "avbroot: $AVBROOT"
 echo "OTA: $OTA"
 echo ""
 
-# Create a blank block-aligned image for --add-partition tests.
-dd if=/dev/zero of="$INPUT_IMG/blank.img" bs=4096 count=1024 status=none
-echo "Created blank image: $(ls -lh "$INPUT_IMG/blank.img" | awk '{print $5}')"
+# extra_part.img is built in the workflow from a signed mi_ext template
+# (HashTree descriptor + Property descriptors). It is required for
+# --add-partition + --dynamic-partition tests because care_map generation
+# reads the AVB footer of every dynamic partition.
+EXTRA_IMG="$INPUT_IMG/extra_part.img"
+if [ ! -f "$EXTRA_IMG" ]; then
+    echo "WARNING: extra_part.img not found; add-partition tests will be skipped"
+fi
 
 DELETE_PART=$(pick_delete_partition)
 echo "Delete partition candidate: '$DELETE_PART'"
@@ -240,16 +245,26 @@ else
     skip_test "t05" "--replace boot (disable-avb)" "boot.img not found"
 fi
 
-# T06: --add-partition (blank image, disable-avb).
-run_test "t06" "--add-partition extra_part (blank, disable-avb)" \
-    --disable-avb --skip-system-ota-cert \
-    --add-partition extra_part "$INPUT_IMG/blank.img"
+# T06: --add-partition (signed image, disable-avb).
+if [ -f "$EXTRA_IMG" ]; then
+    run_test "t06" "--add-partition extra_part (signed, disable-avb)" \
+        --disable-avb --skip-system-ota-cert \
+        --add-partition extra_part "$EXTRA_IMG"
+else
+    skip_test "t06" "--add-partition (signed, disable-avb)" "extra_part.img not found"
+fi
 
 # T07: --add-partition + --dynamic-partition.
-run_test "t07" "--add-partition + --dynamic-partition" \
-    --disable-avb --skip-system-ota-cert \
-    --add-partition extra_part "$INPUT_IMG/blank.img" \
-    --dynamic-partition extra_part
+# Requires a signed image with HashTree + Property descriptors because
+# care_map generation reads the AVB footer of every dynamic partition.
+if [ -f "$EXTRA_IMG" ]; then
+    run_test "t07" "--add-partition + --dynamic-partition" \
+        --disable-avb --skip-system-ota-cert \
+        --add-partition extra_part "$EXTRA_IMG" \
+        --dynamic-partition extra_part
+else
+    skip_test "t07" "--add-partition + --dynamic-partition" "extra_part.img not found"
+fi
 
 # T08: --replace boot (full AVB).
 if [ -f "$BOOT_IMG" ]; then
@@ -320,7 +335,7 @@ fi
 # Expected to FAIL — --super-mode is not a valid avbroot option.
 run_test "t14" "--super-mode (expected FAIL: wrong param in payload.py)" \
     --disable-avb --skip-system-ota-cert \
-    --add-partition extra_part "$INPUT_IMG/blank.img" \
+    --add-partition extra_part "$EXTRA_IMG" \
     --super-mode extra_part
 
 # T15: --fingerprint (payload.py uses this but it was reverted).
