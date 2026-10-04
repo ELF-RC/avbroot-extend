@@ -1,0 +1,109 @@
+name: OTA Patch Test
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ota-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OTA_URL: "https://cdnorg.d.miui.com/V13.0.10.0.SLMCNXM/miui_MUNCH_V13.0.10.0.SLMCNXM_6ce5c0591d_12.0.zip"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: OTA patch test suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install aria2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Build avbroot
+        run: |
+          cargo build --release --locked -p avbroot --bin avbroot
+          cp target/release/avbroot /tmp/avbroot
+          strip /tmp/avbroot || true
+          cargo clean
+          df -h /
+
+      - name: Download OTA (multi-threaded)
+        run: |
+          mkdir -p /tmp/ota /tmp/logs /tmp/keys /tmp/input-img /tmp/output
+          aria2c -x 16 -s 16 -j 1 \
+            --max-tries=5 --retry-wait=10 \
+            --console-log-level=warn \
+            --user-agent="Mozilla/5.0" \
+            -d /tmp/ota -o miui.zip \
+            "$OTA_URL"
+          ls -lh /tmp/ota/
+          df -h /
+
+      - name: Generate signing keys
+        run: |
+          echo "ci-test-pass" > /tmp/keys/passphrase.txt
+          AVBROOT=/tmp/avbroot
+
+          $AVBROOT key generate-key -t rsa4096 -o /tmp/keys/avb.key \
+            --pass-file /tmp/keys/passphrase.txt 2>&1 | tee /tmp/logs/key-gen-avb.log
+          $AVBROOT key generate-key -t rsa4096 -o /tmp/keys/ota.key \
+            --pass-file /tmp/keys/passphrase.txt 2>&1 | tee /tmp/logs/key-gen-ota.log
+          $AVBROOT key encode-avb -k /tmp/keys/avb.key -o /tmp/keys/avb_pkmd.bin \
+            --pass-file /tmp/keys/passphrase.txt 2>&1 | tee /tmp/logs/key-encode-avb.log
+          $AVBROOT key generate-cert -k /tmp/keys/ota.key -o /tmp/keys/ota.crt \
+            --pass-file /tmp/keys/passphrase.txt 2>&1 | tee /tmp/logs/key-gen-cert.log
+
+          ls -lh /tmp/keys/
+          df -h /
+
+      - name: List OTA partitions
+        run: |
+          /tmp/avbroot ota list --input /tmp/ota/miui.zip > /tmp/logs/partition-list.log 2>&1
+          cat /tmp/logs/partition-list.log
+
+      - name: Extract test images
+        run: |
+          /tmp/avbroot ota extract \
+            --input /tmp/ota/miui.zip \
+            --directory /tmp/input-img \
+            --partition boot 2>&1 | tee /tmp/logs/extract-boot.log
+          ls -lh /tmp/input-img/
+          df -h /
+
+      - name: Run OTA patch test suite
+        shell: bash
+        run: |
+          AVBROOT=/tmp/avbroot \
+          OTA=/tmp/ota/miui.zip \
+          KEYS=/tmp/keys \
+          INPUT_IMG=/tmp/input-img \
+          LOGS=/tmp/logs \
+          OUTPUT_DIR=/tmp/output \
+          bash .github/scripts/ota-test.sh
+          df -h /
+
+      - name: Upload all logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ota-test-logs
+          path: /tmp/logs/
+          if-no-files-found: warn
+          retention-days: 14
