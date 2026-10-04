@@ -672,10 +672,41 @@ fn cmdline_prefix(cmdline: &str) -> Option<&str> {
 ///
 /// This is a no-op if the child is signed because it is expected to be chain
 /// loaded by the parent.
-fn update_metadata_descriptors(parent_header: &mut Header, child_header: &Header) {
+///
+/// Before merging, property descriptors in the parent that belong to the child
+/// partition (per the `com.android.build.<partition>.<field>` naming
+/// convention) but are no longer present in the child are removed. Without
+/// this, replacing a partition image with one that carries no property
+/// descriptors would leave the parent referencing stale fingerprints while the
+/// hashtree descriptor already reflects the new image digest.
+fn update_metadata_descriptors(
+    parent_header: &mut Header,
+    child_header: &Header,
+    child_name: &str,
+) {
     if !child_header.public_key.is_empty() {
         return;
     }
+
+    // Keys the child still carries. These are kept (their values are updated
+    // by the merge below) so that we only drop descriptors the child no longer
+    // advertises.
+    let child_prop_keys: HashSet<&str> = child_header
+        .descriptors
+        .iter()
+        .filter_map(|d| match d {
+            Descriptor::Property(p) => Some(p.key.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let prop_prefix = format!("com.android.build.{child_name}.");
+    parent_header.descriptors.retain(|d| match d {
+        Descriptor::Property(p) => {
+            !(p.key.starts_with(prop_prefix.as_str()) && !child_prop_keys.contains(p.key.as_str()))
+        }
+        _ => true,
+    });
 
     for child_descriptor in &child_header.descriptors {
         match child_descriptor {
@@ -852,7 +883,7 @@ fn update_vbmeta_headers(
                 .with_context(|| format!("Failed to load vbmeta footer from image: {dep}"))?;
 
             update_security_descriptors(parent_header, &header, name, dep)?;
-            update_metadata_descriptors(parent_header, &header);
+            update_metadata_descriptors(parent_header, &header, dep);
         }
 
         // Only sign and rewrite the image if we need to. Some vbmeta images may
