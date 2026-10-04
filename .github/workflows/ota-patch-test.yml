@@ -89,25 +89,47 @@ jobs:
 
       - name: Build signed extra_part image
         run: |
-          # Extract mi_ext (small hashtree partition) as a template, then
-          # repack it as extra_part with a signed AVB footer + property
-          # descriptors. blank.img has no AVB footer, so it cannot be used
-          # with --dynamic-partition (care_map generation reads the footer).
+          # A signed extra_part image with a HashTree + Property descriptor is
+          # required for --add-partition + --dynamic-partition tests: care_map
+          # generation reads the AVB footer of every dynamic partition. Pick a
+          # small hashtree partition from the OTA as a template. The available
+          # set varies by MIUI version, so try candidates in order.
           mkdir -p /tmp/extra-tmpl
-          /tmp/avbroot ota extract \
-            --input /tmp/ota/miui.zip \
-            --directory /tmp/extra-tmpl \
-            --partition mi_ext 2>&1 | tee /tmp/logs/extract-mi_ext.log
+          TEMPLATE=""
+          for cand in mi_ext system_dlkm vendor_dlkm odm; do
+            if ! grep -qx "$cand" /tmp/logs/partition-list.log 2>/dev/null; then
+              continue
+            fi
+            echo "Trying template partition: $cand"
+            if /tmp/avbroot ota extract \
+                --input /tmp/ota/miui.zip \
+                --directory /tmp/extra-tmpl \
+                --partition "$cand" >> /tmp/logs/extract-${cand}.log 2>&1 \
+                && [ -f "/tmp/extra-tmpl/${cand}.img" ]; then
+              TEMPLATE="$cand"
+              break
+            fi
+            rm -f "/tmp/extra-tmpl/${cand}.img"
+          done
+
+          if [ -z "$TEMPLATE" ]; then
+            echo "ERROR: No suitable template partition found in OTA" >&2
+            exit 1
+          fi
+          echo "Selected template partition: $TEMPLATE"
 
           cd /tmp/extra-tmpl
-          /tmp/avbroot avb unpack -i mi_ext.img \
-            --output-info extra.toml --output-raw extra.raw 2>&1 | tee /tmp/logs/unpack-mi_ext.log
+          /tmp/avbroot avb unpack -i "${TEMPLATE}.img" \
+            --output-info extra.toml --output-raw extra.raw 2>&1 | tee /tmp/logs/unpack-extra_part.log
 
-          # Rewrite partition_name and property keys to extra_part.
-          python3 - <<'PY'
+          # Rewrite partition_name and property keys to extra_part, using the
+          # actual template partition name (not a hardcoded string).
+          python3 - "$TEMPLATE" <<'PY'
+          import sys
+          tmpl = sys.argv[1]
           s = open('extra.toml').read()
-          s = s.replace('partition_name = "mi_ext"', 'partition_name = "extra_part"')
-          s = s.replace('com.android.build.mi_ext.', 'com.android.build.extra_part.')
+          s = s.replace(f'partition_name = "{tmpl}"', 'partition_name = "extra_part"')
+          s = s.replace(f'com.android.build.{tmpl}.', 'com.android.build.extra_part.')
           open('extra.toml', 'w').write(s)
           PY
 
