@@ -1405,6 +1405,121 @@ fn patch_ota_payload(
         added_compressed_files.insert(name.clone(), (input_file, vec![ops_range]));
     }
 
+    // Attach added partitions to the root vbmeta's chain of trust. Without
+    // this, a newly added partition image is never referenced by any vbmeta
+    // descriptor, so the bootloader's AVB verification rejects it even though
+    // the payload data is valid. The root vbmeta is the trust anchor that
+    // every other vbmeta is chained from, so descriptors added here are
+    // reachable from any boot path.
+    if !disable_avb && !added_raw_files.is_empty() {
+        let Some(key_avb) = key_avb else {
+            bail!("--key-avb is required to attach added partitions to AVB");
+        };
+        let block_size_v: u64 = header.manifest.block_size().into();
+
+        let root_header = vbmeta_headers
+            .get_mut("vbmeta")
+            .context("Root vbmeta image not found; cannot attach added partitions")?;
+        let orig_root_header = root_header.clone();
+
+        // Rollback index locations must be unique per chain. Pick the next free
+        // slot after the largest existing chain location.
+        let mut next_rollback = root_header
+            .descriptors
+            .iter()
+            .filter_map(|d| match d {
+                Descriptor::ChainPartition(c) => Some(c.rollback_index_location),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        for (name, raw_file) in &added_raw_files {
+            let _span = debug_span!("image", name).entered();
+
+            let (child_header, _, _) = {
+                let mut reader = UserPosFile::new(raw_file.clone());
+                avb::load_image(&mut reader).with_context(|| {
+                    format!("Failed to load AVB metadata for added partition: {name}")
+                })?
+            };
+
+            // Drop any stale descriptor or property belonging to this partition
+            // so that the root vbmeta does not carry conflicting metadata from
+            // a previous run or a pre-existing image.
+            let prop_prefix = format!("com.android.build.{name}.");
+            let child_prop_keys: HashSet<&str> = child_header
+                .descriptors
+                .iter()
+                .filter_map(|d| match d {
+                    Descriptor::Property(p) => Some(p.key.as_str()),
+                    _ => None,
+                })
+                .collect();
+            root_header.descriptors.retain(|d| match d {
+                Descriptor::Property(p) => {
+                    !(p.key.starts_with(prop_prefix.as_str())
+                        && !child_prop_keys.contains(p.key.as_str()))
+                }
+                d if d.partition_name() == Some(name.as_str()) => false,
+                _ => true,
+            });
+
+            if child_header.public_key.is_empty() {
+                // Unsigned (NONE) image: copy the child's hash/hashtree
+                // descriptor into the root and merge property/cmdline
+                // descriptors, exactly as update_security_descriptors and
+                // update_metadata_descriptors would for a replaced image.
+                for d in &child_header.descriptors {
+                    match d {
+                        Descriptor::HashTree(_) | Descriptor::Hash(_) => {
+                            root_header.descriptors.push(d.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                update_metadata_descriptors(root_header, &child_header, name);
+            } else {
+                // Signed image: the root cannot embed the child's hashtree
+                // (which is signed by the child's key). Instead, chain to the
+                // child's public key so the bootloader verifies the child
+                // against its own signature.
+                let chain = avb::ChainPartitionDescriptor {
+                    rollback_index_location: next_rollback,
+                    partition_name: name.clone(),
+                    public_key: child_header.public_key.clone(),
+                    flags: 0,
+                    reserved: [0; 60],
+                };
+                next_rollback += 1;
+                root_header.descriptors.push(Descriptor::ChainPartition(chain));
+            }
+
+            info!("Attached added partition to root vbmeta: {name}");
+        }
+
+        if root_header != &orig_root_header {
+            root_header
+                .set_algo_for_key(key_avb, false)
+                .context("Failed to set signature algorithm for root vbmeta")?;
+            root_header
+                .sign(key_avb, method)
+                .context("Failed to sign root vbmeta")?;
+
+            let mut writer = tempfile::tempfile()
+                .context("Failed to create temp file for root vbmeta")?;
+            avb::write_root_image(&mut writer, root_header, block_size_v)
+                .context("Failed to write root vbmeta image")?;
+
+            let vbmeta_file = input_files
+                .get_mut("vbmeta")
+                .context("Root vbmeta not present in input files")?;
+            vbmeta_file.file = Arc::new(writer);
+            vbmeta_file.state = InputFileState::Modified;
+        }
+    }
+
     let care_map =
         if disable_avb && dynamic_partitions.is_empty() && deleted_dynamic_partitions.is_empty() {
             None
