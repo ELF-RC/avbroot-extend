@@ -17,13 +17,15 @@ avbroot
         ├── --disable-avb
         ├── --add-partition <PARTITION> <FILE> [SIZE]   可重复
         ├── --dynamic-partition <PARTITION>             可重复
-        └── --delete-partition <PARTITION>              可重复
+        ├── --delete-partition <PARTITION>              可重复
+        └── --temp-dir <DIR>                            覆盖 TMPDIR
 ```
 
 - `--disable-avb`：关闭根 `vbmeta` 镜像中的 AVB 验证和 hashtree 验证，因此可以省略 `--key-avb`。OTA payload 本身仍会正常签名。
 - `--add-partition <PARTITION> <FILE> [SIZE]`：将完整分区镜像作为新的 payload `PartitionUpdate` 添加进去。参数可重复；指定 `SIZE` 时，会用零填充镜像到该大小。
 - `--dynamic-partition <PARTITION>`：将分区名写入 payload 元数据中的第一个 `DynamicPartitionGroup`。参数可重复，并且每个名称都必须与 `--add-partition` 提供的某个 `PARTITION` 匹配。该参数用于新增逻辑分区。
 - `--delete-partition <PARTITION>`：从 payload 中删除该分区的 `PartitionUpdate`。对于逻辑分区，还会从所有动态分区组中删除该名称；对于静态分区，只是不再由 OTA 刷写该分区。参数可重复。
+- `--temp-dir <DIR>`：修补过程中临时文件的存放目录。覆盖 `TMPDIR` 环境变量，适用于修补大型 OTA 时需要数 GB 临时空间的场景。
 
 ## 贡献者
 - [ELF-RC](https://github.com/ELF-RC)
@@ -248,6 +250,7 @@ avbroot
 │   │   ├── --disable-avb                           与 --clear-vbmeta-flags 互斥
 │   │   ├── --vabc-algo <ALGO>                       none | lz4 | gz[,LEVEL]
 │   │   ├── --zip-mode <MODE>                        streaming | seekable；默认：streaming
+│   │   ├── --temp-dir <DIR>                         覆盖 TMPDIR
 │   │   └── --boot-partition <PARTITION>              隐藏兼容参数
 │   ├── extract
 │   │   ├── -i, --input <FILE>

@@ -17,13 +17,15 @@ avbroot
         ├── --disable-avb
         ├── --add-partition <PARTITION> <FILE> [SIZE]   repeatable
         ├── --dynamic-partition <PARTITION>             repeatable
-        └── --delete-partition <PARTITION>              repeatable
+        ├── --delete-partition <PARTITION>              repeatable
+        └── --temp-dir <DIR>                            overrides TMPDIR
 ```
 
 - `--disable-avb`: disables AVB verification and hashtree verification in the root `vbmeta` image, allowing `--key-avb` to be omitted. The OTA payload is still signed normally.
 - `--add-partition <PARTITION> <FILE> [SIZE]`: adds a full partition image as a new payload `PartitionUpdate`. It can be repeated; when `SIZE` is specified, the image is zero-padded to that size.
 - `--dynamic-partition <PARTITION>`: adds the partition name to the first `DynamicPartitionGroup` in the payload metadata. It can be repeated, and every name must match a `PARTITION` supplied to `--add-partition`. This is intended for newly added logical partitions.
 - `--delete-partition <PARTITION>`: removes the partition's `PartitionUpdate` from the payload. For logical partitions, it also removes the name from every dynamic partition group; for static partitions, it only stops the OTA from flashing that partition. It can be repeated.
+- `--temp-dir <DIR>`: directory for temporary files created during patching. Overrides the `TMPDIR` environment variable, which is useful when patching large OTAs that need several GB of scratch space.
 
 ## Contributors
 - [ELF-RC](https://github.com/ELF-RC)
@@ -248,6 +250,7 @@ avbroot
 │   │   ├── --disable-avb                           conflicts with --clear-vbmeta-flags
 │   │   ├── --vabc-algo <ALGO>                       none | lz4 | gz[,LEVEL]
 │   │   ├── --zip-mode <MODE>                        streaming | seekable; default: streaming
+│   │   ├── --temp-dir <DIR>                         overrides TMPDIR
 │   │   └── --boot-partition <PARTITION>              hidden compatibility option
 │   ├── extract
 │   │   ├── -i, --input <FILE>
