@@ -65,11 +65,29 @@ jobs:
             find target -type f -printf '%p %s bytes\\n' 2>/dev/null | sort || true
           } > ci-logs/collection.log 2>&1
 
+      - name: Compute artifact name components
+        id: artifact_name
+        if: always()
+        shell: bash
+        run: |
+          # Tag: nearest git tag, or short commit hash fallback.
+          TAG="$(git describe --tags --always 2>/dev/null || echo unknown)"
+          # Sanitize: replace slashes and ref-unsafe chars.
+          TAG="$(printf '%s' "$TAG" | tr '/' '-')"
+          # Shanghai time (UTC+8).
+          TIMESTAMP="$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
+          {
+            echo "tag=${TAG}"
+            echo "timestamp=${TIMESTAMP}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Artifact tag: ${TAG}"
+          echo "Shanghai timestamp: ${TIMESTAMP}"
+
       - name: Upload avbroot binary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: avbroot-${{ matrix.arch }}
+          name: avbroot-extend_${{ steps.artifact_name.outputs.tag }}_${{ matrix.arch }}_${{ steps.artifact_name.outputs.timestamp }}
           path: target/release/avbroot
           if-no-files-found: warn
           retention-days: 14
@@ -78,7 +96,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ matrix.arch }}
+          name: logs-extend_${{ steps.artifact_name.outputs.tag }}_${{ matrix.arch }}_${{ steps.artifact_name.outputs.timestamp }}
           path: ci-logs
           if-no-files-found: warn
           retention-days: 14
