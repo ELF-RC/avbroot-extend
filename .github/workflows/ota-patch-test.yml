@@ -143,6 +143,27 @@ jobs:
           ls -lh /tmp/input-img/extra_part.img
           df -h /
 
+      - name: Generate baseline manifest
+        run: |
+          # Extract the original payload.bin and decode its manifest to TOML.
+          # verify-manifest.py uses this as the baseline for 'same' assertions
+          # (partition set unchanged minus expected add/delete).
+          mkdir -p /tmp/baseline
+          python3 - <<'PY'
+          import zipfile
+          z = zipfile.ZipFile('/tmp/ota/miui.zip')
+          names = [n for n in z.namelist() if n.endswith('payload.bin')]
+          if not names:
+              raise SystemExit('no payload.bin in OTA')
+          open('/tmp/baseline/payload.bin','wb').write(z.read(names[0]))
+          print(f'extracted payload.bin: {len(open("/tmp/baseline/payload.bin","rb").read())} bytes')
+          PY
+
+          /tmp/avbroot payload unpack -i /tmp/baseline/payload.bin \
+            --output-info /tmp/baseline-manifest.toml --no-output-images -q \
+            2>&1 | tee /tmp/logs/baseline-manifest.log
+          ls -lh /tmp/baseline-manifest.toml
+
       - name: Run OTA patch test suite
         shell: bash
         run: |
@@ -152,6 +173,7 @@ jobs:
           INPUT_IMG=/tmp/input-img \
           LOGS=/tmp/logs \
           OUTPUT_DIR=/tmp/output \
+          BASELINE_MANIFEST=/tmp/baseline-manifest.toml \
           bash .github/scripts/ota-test.sh
           df -h /
 
